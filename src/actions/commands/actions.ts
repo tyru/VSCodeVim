@@ -14,7 +14,7 @@ import { NumericString } from './../../common/number/numericString';
 import { configuration } from './../../configuration/configuration';
 import { ModeName } from './../../mode/mode';
 import { VisualBlockMode } from './../../mode/modes';
-import { Register, RegisterMode } from './../../register/register';
+import { Register, RegisterMode, IRegisterContent } from './../../register/register';
 import { SearchDirection, SearchState } from './../../state/searchState';
 import { EditorScrollByUnit, EditorScrollDirection, TextEditor } from './../../textEditor';
 import { isTextTransformation } from './../../transformations/transformations';
@@ -1257,7 +1257,6 @@ export class PutCommand extends BaseCommand {
     adjustIndent: boolean = false
   ): Promise<VimState> {
     const register = await Register.get(vimState);
-    const dest = after ? position : position.getRight();
 
     if (register.text instanceof RecordedState) {
       /**
@@ -1275,27 +1274,42 @@ export class PutCommand extends BaseCommand {
         replay: 'keystrokes',
       });
       return vimState;
-    } else if (typeof register.text === 'object' && vimState.currentMode === ModeName.VisualBlock) {
-      return await this.execVisualBlockPaste(register.text, position, vimState, after);
     }
 
     let text = await PutCommand.GetText(vimState, this.multicursorIndex);
 
+    const dest = after ? position : position.getRight();
+    const result = this.getInsertedText(vimState, text, dest, register, after, adjustIndent);
+
+    vimState.recordedState.transformations.push({
+      type: 'insertText',
+      text: result.textToAdd,
+      position: result.whereToAddText,
+      diff: result.diff,
+    });
+
+    vimState.currentRegisterMode = register.registerMode;
+    return vimState;
+  }
+
+  private getInsertedText(
+    vimState: VimState,
+    text: string,
+    position: Position,
+    register: IRegisterContent,
+    after: boolean,
+    adjustIndent: boolean
+  ): {
+    textToAdd: string,
+    whereToAddText: Position,
+    diff: PositionDiff,
+  } {
     let textToAdd: string;
     let whereToAddText: Position;
-    let diff = new PositionDiff(0, 0);
 
     if (register.registerMode === RegisterMode.CharacterWise) {
       textToAdd = text;
-      whereToAddText = dest;
-    } else if (
-      (vimState.currentMode === ModeName.Visual || vimState.currentMode === ModeName.VisualLine) &&
-      register.registerMode === RegisterMode.LineWise
-    ) {
-      // in the specific case of linewise register data during visual mode,
-      // we need extra newline feeds
-      textToAdd = (vimState.currentMode === ModeName.Visual ? '\n' : '') + text + '\n';
-      whereToAddText = dest;
+      whereToAddText = position;
     } else {
       if (adjustIndent) {
         // Adjust indent to current line
@@ -1317,34 +1331,26 @@ export class PutCommand extends BaseCommand {
       if (after) {
         // P insert before current line
         textToAdd = text + '\n';
-        whereToAddText = dest.getLineBegin();
+        whereToAddText = position.getLineBegin();
       } else {
         // p paste after current line
         textToAdd = '\n' + text;
-        whereToAddText = dest.getLineEnd();
+        whereToAddText = position.getLineEnd();
       }
     }
 
-    // After using "p" or "P" in Visual mode the text that was put will be
-    // selected (from Vim's ":help gv").
-    if (
-      vimState.currentMode === ModeName.Visual ||
-      vimState.currentMode === ModeName.VisualLine ||
-      vimState.currentMode === ModeName.VisualBlock
-    ) {
-      vimState.lastVisualMode = vimState.currentMode;
-      vimState.lastVisualSelectionStart = whereToAddText;
-      let textToEnd = textToAdd;
-      if (
-        vimState.currentMode === ModeName.VisualLine &&
-        textToAdd[textToAdd.length - 1] === '\n'
-      ) {
-        // don't go next line
-        textToEnd = textToAdd.substring(0, textToAdd.length - 1);
-      }
-      vimState.lastVisualSelectionEnd = whereToAddText.advancePositionByText(textToEnd);
-    }
+    const diff = this.calculateDiff(text, textToAdd, position, register, after);
+    return { textToAdd, whereToAddText, diff };
+  }
 
+  private calculateDiff(
+    text: string,
+    textToAdd: string,
+    position: Position,
+    register: IRegisterContent,
+    after: boolean
+  ): PositionDiff {
+    let diff = new PositionDiff(0, 0);
     // More vim weirdness: If the thing you're pasting has a newline, the cursor
     // stays in the same place. Otherwise, it moves to the end of what you pasted.
 
@@ -1386,53 +1392,7 @@ export class PutCommand extends BaseCommand {
       }
     }
 
-    vimState.recordedState.transformations.push({
-      type: 'insertText',
-      text: textToAdd,
-      position: whereToAddText,
-      diff: diff,
-    });
-
-    vimState.currentRegisterMode = register.registerMode;
-    return vimState;
-  }
-
-  private async execVisualBlockPaste(
-    block: string[],
-    position: Position,
-    vimState: VimState,
-    after: boolean
-  ): Promise<VimState> {
-    if (after) {
-      position = position.getRight();
-    }
-
-    // Add empty lines at the end of the document, if necessary.
-    let linesToAdd = Math.max(0, block.length - (TextEditor.getLineCount() - position.line) + 1);
-
-    if (linesToAdd > 0) {
-      await TextEditor.insertAt(
-        Array(linesToAdd).join('\n'),
-        new Position(
-          TextEditor.getLineCount() - 1,
-          TextEditor.getLineAt(new Position(TextEditor.getLineCount() - 1, 0)).text.length
-        )
-      );
-    }
-
-    // paste the entire block.
-    for (let lineIndex = position.line; lineIndex < position.line + block.length; lineIndex++) {
-      const line = block[lineIndex - position.line];
-      const insertPos = new Position(
-        lineIndex,
-        Math.min(position.character, TextEditor.getLineAt(new Position(lineIndex, 0)).text.length)
-      );
-
-      await TextEditor.insertAt(line, insertPos);
-    }
-
-    vimState.currentRegisterMode = RegisterMode.AscertainFromCurrentMode;
-    return vimState;
+    return diff;
   }
 
   public async execCount(position: Position, vimState: VimState): Promise<VimState> {
@@ -1527,7 +1487,7 @@ export class PutWithIndentCommand extends BaseCommand {
 @RegisterAction
 export class PutCommandVisual extends BaseCommand {
   keys = [['p'], ['P']];
-  modes = [ModeName.Visual, ModeName.VisualLine];
+  modes = [ModeName.Visual, ModeName.VisualLine, ModeName.VisualBlock];
   runsOnceForEachCountPrefix = true;
 
   public async exec(
@@ -1535,50 +1495,143 @@ export class PutCommandVisual extends BaseCommand {
     vimState: VimState,
     after: boolean = false
   ): Promise<VimState> {
+    const register = await Register.get(vimState);
+    if (vimState.currentMode === ModeName.VisualBlock) {
+      if (!(register.text instanceof RecordedState) && typeof register.text === 'object') {
+        return await this.execVisualBlockPaste(register.text, position, vimState, after);
+      }
+      // TODO: delete ranges if there is no data in register? (replace ranges with empty text)
+      return vimState;
+    }
+
     let start = vimState.cursorStartPosition;
     let end = vimState.cursorPosition;
-    const isLineWise = vimState.currentMode === ModeName.VisualLine;
+    let reversed = false;
     if (start.isAfter(end)) {
       [start, end] = [end, start];
+      reversed = true;
     }
 
-    // If the to be inserted text is linewise we have a seperate logic delete the
-    // selection first than insert
-    let oldMode = vimState.currentMode;
-    let register = await Register.get(vimState);
-    if (register.registerMode === RegisterMode.LineWise) {
-      let deleteResult = await new operator.DeleteOperator(this.multicursorIndex).run(
-        vimState,
-        start,
-        end,
-        false
+    let text = await PutCommand.GetText(vimState, this.multicursorIndex);
+    const result = this.getReplaceText(vimState, text, start, end, reversed, register);
+    if (!result.handled) {
+      return vimState;
+    }
+
+    const resultState = await new operator.YankOperator(this.multicursorIndex).run(vimState, start, end);
+
+    this.updateLastSelection(resultState, start, end);
+
+    resultState.recordedState.transformations.push({
+      type: 'replaceText',
+      text: result.textToReplace,
+      start: result.start,
+      end: result.end,
+      diff: result.diff,
+    });
+    return resultState;
+  }
+
+  private async execVisualBlockPaste(
+    block: string[],
+    position: Position,
+    vimState: VimState,
+    after: boolean
+  ): Promise<VimState> {
+    if (after) {
+      position = position.getRight();
+    }
+
+    // Add empty lines at the end of the document, if necessary.
+    let linesToAdd = Math.max(0, block.length - (TextEditor.getLineCount() - position.line) + 1);
+
+    if (linesToAdd > 0) {
+      await TextEditor.insertAt(
+        Array(linesToAdd).join('\n'),
+        new Position(
+          TextEditor.getLineCount() - 1,
+          TextEditor.getLineAt(new Position(TextEditor.getLineCount() - 1, 0)).text.length
+        )
       );
-      // to ensure, that the put command nows this is
-      // an linewise register insertion in visual mode of
-      // characterwise, linewise
-      let resultMode = deleteResult.currentMode;
-      deleteResult.currentMode = oldMode;
-      deleteResult = await new PutCommand().exec(start, deleteResult, true);
-      deleteResult.currentMode = resultMode;
-      return deleteResult;
     }
 
-    // The reason we need to handle Delete and Yank separately is because of
-    // linewise mode. If we're in visualLine mode, then we want to copy
-    // linewise but not necessarily delete linewise.
-    let putResult = await new PutCommand(this.multicursorIndex).exec(start, vimState, true);
-    putResult.currentRegisterMode = isLineWise ? RegisterMode.LineWise : RegisterMode.CharacterWise;
-    putResult.recordedState.registerName = configuration.useSystemClipboard ? '*' : '"';
-    putResult = await new operator.YankOperator(this.multicursorIndex).run(putResult, start, end);
-    putResult.currentRegisterMode = RegisterMode.CharacterWise;
-    putResult = await new operator.DeleteOperator(this.multicursorIndex).run(
-      putResult,
-      start,
-      end.getLeftIfEOL(),
-      false
-    );
-    putResult.currentRegisterMode = RegisterMode.AscertainFromCurrentMode;
-    return putResult;
+    // paste the entire block.
+    for (let lineIndex = position.line; lineIndex < position.line + block.length; lineIndex++) {
+      const line = block[lineIndex - position.line];
+      const insertPos = new Position(
+        lineIndex,
+        Math.min(position.character, TextEditor.getLineAt(new Position(lineIndex, 0)).text.length)
+      );
+
+      await TextEditor.insertAt(line, insertPos);
+    }
+
+    vimState.currentRegisterMode = RegisterMode.AscertainFromCurrentMode;
+    return vimState;
+  }
+
+  private getReplaceText(
+    vimState: VimState,
+    text: string,
+    start: Position,
+    end: Position,
+    reversed: boolean,
+    register: IRegisterContent
+  ): {
+    textToReplace: string,
+    diff: PositionDiff,
+    start: Position,
+    end: Position,
+    handled: boolean
+  } {
+    let textToReplace: string = text;
+    let diff = new PositionDiff(0, 0);
+
+    // in visual mode, we need extra newline feeds
+    if (vimState.currentMode === ModeName.Visual && register.registerMode === RegisterMode.CharacterWise) {
+      end = end.getRight();
+      if (text.indexOf('\n') === -1) {
+        if (start.getRight().isEqual(end)) {
+          // When start + 1 === end, cursor doesn't move to the end of inserted text
+          diff = new PositionDiff(0, text.length - 1);
+        }
+      } else {
+        diff = PositionDiff.NewBOLDiff(-1);
+      }
+      return { textToReplace, diff, start, end, handled: true };
+
+    } else if (vimState.currentMode === ModeName.Visual && register.registerMode === RegisterMode.LineWise) {
+      textToReplace = '\n' + text + '\n';
+      // if (!reversed) {
+      //   const numNewline = [...text].filter(c => c === '\n').length;
+      //   diff = PositionDiff.NewBOLDiff(-numNewline);
+      // } else if (end.isAtDocumentEnd()) {
+      //   diff = PositionDiff.NewBOLDiff(1);
+      // } else {
+      //   const numNewline = [...text].filter(c => c === '\n').length;
+      //   diff = PositionDiff.NewBOLDiff(-numNewline - (end.isLineEnd() ? 1 : 0));
+      // }
+      end = end.getRight();
+      return { textToReplace, diff, start, end, handled: true };
+
+    } else if (vimState.currentMode === ModeName.VisualLine && register.registerMode === RegisterMode.CharacterWise) {
+      return { textToReplace, diff, start, end, handled: true };
+
+    } else if (vimState.currentMode === ModeName.VisualLine && register.registerMode === RegisterMode.LineWise) {
+      return { textToReplace, diff, start, end, handled: true };
+    }
+
+    return { textToReplace, diff, start, end, handled: false };
+  }
+
+  /**
+   * After using "p" or "P" in Visual mode the text that was put will be
+   * selected (from Vim's ":help gv").
+   */
+  private updateLastSelection(vimState: VimState, start: Position, end: Position): void {
+    vimState.lastVisualMode = vimState.currentMode;
+    vimState.lastVisualSelectionStart = start;
+    vimState.lastVisualSelectionEnd = end;
   }
 
   // TODO - execWithCount
